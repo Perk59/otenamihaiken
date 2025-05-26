@@ -139,45 +139,200 @@ class AdvancedProxyHandler {
         );
     }
 
-    private function handleApiRequest() {
-        $content = $this->fetchContentWithCurl();
+        private function processHtmlContent($content) {
+        try {
+            // 文字エンコーディングの処理
+            if (function_exists('mb_convert_encoding')) {
+                $content = mb_convert_encoding($content, 'UTF-8', 'auto');
+            }
 
-        // HTMLレスポンスのチェック（JSONを期待している場合）
-        if (strpos($content, '<!DOCTYPE html') !== false || strpos($content, '<html') !== false) {
-            header('Content-Type: application/json');
-            echo json_encode([
-                'status' => 'error',
-                'message' => 'Authentication required or session expired',
-                'redirect_required' => true
-            ]);
-            return true;
+            // 文字エンコーディングメタタグの追加/更新
+            if (!preg_match('/<meta[^>]+charset/i', $content)) {
+                $content = preg_replace(
+                    '/(<head[^>]*>)/i',
+                    '$1<meta charset="utf-8">',
+                    $content,
+                    1
+                );
+            } else {
+                $content = preg_replace(
+                    '/(<meta[^>]+charset=[\'"]?)([a-zA-Z0-9_-]+)([\'"]?[^>]*>)/i',
+                    '$1utf-8$3',
+                    $content
+                );
+            }
+
+            // ベースURLの設定
+            $baseUrl = parse_url($this->targetUrl);
+            $baseHost = $baseUrl['scheme'] . '://' . $baseUrl['host'];
+            $basePath = isset($baseUrl['path']) ? dirname($baseUrl['path']) : '';
+
+            if (strpos($content, '<base') === false) {
+                $content = preg_replace(
+                    '/(<head[^>]*>)/i',
+                    '$1<base href="' . htmlspecialchars($baseHost . $basePath . '/', ENT_QUOTES, 'UTF-8') . '">',
+                    $content,
+                    1
+                );
+            }
+
+            // メタリフレッシュの除去
+            $content = preg_replace(
+                '/<meta[^>]+http-equiv=["\']?refresh["\']?[^>]*>/i',
+                '',
+                $content
+            );
+
+            // リンクのURL書き換え
+            $content = $this->rewriteHtmlUrls($content);
+
+            // プロキシスクリプトの追加
+            if (strpos($content, '</body>') !== false) {
+                $proxyScript = $this->generateProxyScript();
+                $content = str_replace('</body>', $proxyScript . '</body>', $content);
+            }
+
+            return $content;
+
+        } catch (Exception $e) {
+            error_log('HTML processing error: ' . $e->getMessage());
+            return $content; // エラーが発生した場合は元のコンテンツを返す
         }
+    }
 
-        // JSONレスポンスの処理
-        $decodedContent = json_decode($content, true);
-        if (json_last_error() === JSON_ERROR_NONE) {
-            $content = $this->rewriteJsonUrls($content);
+    private function processCssContent($content) {
+        try {
+            if (function_exists('mb_convert_encoding')) {
+                $content = mb_convert_encoding($content, 'UTF-8', 'auto');
+            }
+
+            $baseHost = $this->targetScheme . '://' . $this->targetHost;
             
-            // レスポンスヘッダーの設定
-            $this->setApiResponseHeaders();
-            echo $content;
-            return true;
+            return preg_replace_callback(
+                '/url\(["\']?([^"\']+)["\']?\)/i',
+                function($matches) use ($baseHost) {
+                    $url = $matches[1];
+                    if (strpos($url, 'data:') === 0) {
+                        return 'url("' . $url . '")';
+                    }
+                    
+                    if (strpos($url, 'http') === 0) {
+                        return 'url("' . $this->proxyBaseUrl . urlencode($url) . '")';
+                    }
+                    
+                    $fullUrl = $baseHost . '/' . ltrim($url, '/');
+                    return 'url("' . $this->proxyBaseUrl . urlencode($fullUrl) . '")';
+                },
+                $content
+            );
+        } catch (Exception $e) {
+            error_log('CSS processing error: ' . $e->getMessage());
+            return $content;
         }
+    }
 
-        // エラー処理
-        header('Content-Type: application/json');
-        echo json_encode([
-            'status' => 'error',
-            'message' => 'Invalid response format',
-            'details' => json_last_error_msg()
-        ]);
-        return true;
+    private function processJsContent($content) {
+        try {
+            if (function_exists('mb_convert_encoding')) {
+                $content = mb_convert_encoding($content, 'UTF-8', 'auto');
+            }
+
+            $baseHost = $this->targetScheme . '://' . $this->targetHost;
+            
+            $patterns = [
+                '/"(https?:\/\/[^"]+)"/i',
+                "/'(https?:\/\/[^']+)'/i",
+                '/(fetch|ajax|get|post)\s*\(\s*["\']([^"\']+)["\']/i',
+                '/(\burl\s*=\s*["\'])(https?:\/\/[^"\']+)(["\'])/i'
+            ];
+
+            foreach ($patterns as $pattern) {
+                $content = preg_replace_callback(
+                    $pattern,
+                    function($matches) use ($baseHost) {
+                        if (count($matches) === 2) {
+                            $url = $matches[1];
+                            if (strpos($url, $this->proxyBaseUrl) === 0) {
+                                return '"' . $url . '"';
+                            }
+                            return '"' . $this->proxyBaseUrl . urlencode($url) . '"';
+                        }
+                        $url = $matches[2];
+                        if (strpos($url, $this->proxyBaseUrl) === 0) {
+                            return $matches[1] . $url . (isset($matches[3]) ? $matches[3] : '');
+                        }
+                        return $matches[1] . $this->proxyBaseUrl . urlencode($url) . 
+                               (isset($matches[3]) ? $matches[3] : '');
+                    },
+                    $content
+                );
+            }
+
+            return $content;
+
+        } catch (Exception $e) {
+            error_log('JavaScript processing error: ' . $e->getMessage());
+            return $content;
+        }
     }
 
     private function setApiResponseHeaders() {
-        header('Content-Type: application/json');
-        header('Cache-Control: no-store, no-cache, must-revalidate');
-        header('Pragma: no-cache');
+        if (!headers_sent()) {
+            header('Content-Type: application/json; charset=utf-8');
+            header('Cache-Control: no-store, no-cache, must-revalidate');
+            header('Pragma: no-cache');
+            header('Access-Control-Allow-Origin: *');
+            header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
+            header('Access-Control-Allow-Headers: Content-Type, Authorization');
+        }
+    }
+
+    private function handleApiRequest() {
+        try {
+            $content = $this->fetchContentWithCurl();
+
+            // HTMLレスポンスのチェック
+            if (strpos($content, '<!DOCTYPE html') !== false || strpos($content, '<html') !== false) {
+                $this->setApiResponseHeaders();
+                return json_encode([
+                    'status' => 'error',
+                    'message' => 'Authentication required or session expired',
+                    'redirect_required' => true
+                ]);
+            }
+
+            // JSONの処理
+            if ($content) {
+                // 文字エンコーディングの処理
+                if (function_exists('mb_convert_encoding')) {
+                    $content = mb_convert_encoding($content, 'UTF-8', 'auto');
+                }
+
+                $decodedContent = json_decode($content, true);
+                if (json_last_error() === JSON_ERROR_NONE) {
+                    $content = $this->rewriteJsonUrls($content);
+                    $this->setApiResponseHeaders();
+                    return $content;
+                }
+            }
+
+            // エラー処理
+            $this->setApiResponseHeaders();
+            return json_encode([
+                'status' => 'error',
+                'message' => 'Invalid response format',
+                'error' => json_last_error_msg()
+            ]);
+
+        } catch (Exception $e) {
+            error_log('API request error: ' . $e->getMessage());
+            $this->setApiResponseHeaders();
+            return json_encode([
+                'status' => 'error',
+                'message' => 'API request failed',
+                'error' => $e->getMessage()
+            ]);
+        }
     }
 
     private function fetchContent() {
@@ -367,9 +522,8 @@ class AdvancedProxyHandler {
     if (strpos($this->targetHost, 'instagram.com') !== false) {
         // 最終的な文字エンコーディングチェック
         if (!mb_check_encoding($content, 'UTF-8')) {
-            // 最後の手段：htmlentitiesを使用
-            $content = htmlentities($content, ENT_QUOTES | ENT_HTML5, 'UTF-8', false);
-            $content = html_entity_decode($content, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            // フォールバックで自動判別→UTF-8 変換
+            $content = mb_convert_encoding($content, 'UTF-8', 'auto');
         }
     }
 
@@ -439,7 +593,7 @@ class AdvancedProxyHandler {
     private function ensureJsonEncoding($content) {
         // JSONデータのエンコーディング処理
         if (function_exists('mb_convert_encoding')) {
-            $content = mb_convert_encoding($content, 'UTF-8', 'ASCII,JIS,UTF-8,EUC-JP,SJIS');
+            $content = mb_convert_encoding($content, 'UTF-8', 'auto');
         }
         
         // JSONの妥当性チェック
@@ -523,54 +677,7 @@ class AdvancedProxyHandler {
         return $content;
     }
 
-    private function processCssContent($content) {
-        $baseHost = $this->targetScheme . '://' . $this->targetHost;
-        
-        return preg_replace_callback(
-            '/url\(["\']?([^"\']+)["\']?\)/i',
-            function($matches) use ($baseHost) {
-                $url = $matches[1];
-                if (strpos($url, 'data:') === 0) {
-                    return 'url("' . $url . '")';
-                }
-                
-                if (strpos($url, 'http') === 0) {
-                    return 'url("' . $this->proxyBaseUrl . urlencode($url) . '")';
-                }
-                
-                $fullUrl = $baseHost . '/' . ltrim($url, '/');
-                return 'url("' . $this->proxyBaseUrl . urlencode($fullUrl) . '")';
-            },
-            $content
-        );
-    }
-
-    private function processJsContent($content) {
-        $baseHost = $this->targetScheme . '://' . $this->targetHost;
-        
-        $patterns = [
-            '/"(https?:\/\/[^"]+)"/i',
-            "/'(https?:\/\/[^']+)'/i",
-            '/(fetch|ajax|get|post)\s*\(\s*["\']([^"\']+)["\']/i',
-            '/(\burl\s*=\s*["\'])(https?:\/\/[^"\']+)(["\'])/i'
-        ];
-
-        foreach ($patterns as $pattern) {
-            $content = preg_replace_callback(
-                $pattern,
-                function($matches) use ($baseHost) {
-                    if (count($matches) === 2) {
-                        return '"' . $this->proxyBaseUrl . urlencode($matches[1]) . '"';
-                    }
-                    return $matches[1] . $this->proxyBaseUrl . urlencode($matches[2]) . (isset($matches[3]) ? $matches[3] : '');
-                },
-                $content
-            );
-        }
-
-        return $content;
-    }
-
+    
     private function rewriteJsonUrls($content) {
         return preg_replace_callback(
             '/"(https?:\/\/[^"]+)"/i',
