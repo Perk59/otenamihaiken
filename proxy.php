@@ -469,7 +469,7 @@ class AdvancedProxyHandler {
         return $content;
     }
     
-        private function processJsContent($content) {
+    private function processJsContent($content) {
         // JavaScript内のURL書き換え（包括的な処理）
         $baseUrl = parse_url($this->targetUrl);
         $baseHost = $baseUrl['scheme'] . '://' . $baseUrl['host'];
@@ -481,7 +481,7 @@ class AdvancedProxyHandler {
         // 1. 文字列リテラル内のHTTP(S) URLを書き換え
         // シングルクォート文字列
         $content = preg_replace_callback(
-            "/'(https?:\\/\\/[^']*?)'/",
+            "/'(https?:\/\/[^']*?)'/",
             function($matches) use ($proxyBase) {
                 return "'" . $proxyBase . urlencode($matches[1]) . "'";
             },
@@ -490,7 +490,7 @@ class AdvancedProxyHandler {
         
         // ダブルクォート文字列
         $content = preg_replace_callback(
-            '/"(https?:\\/\\/[^"]*?)"/',  // この行を修正
+            '/"(https?:\/\/[^"]*?)"/',
             function($matches) use ($proxyBase) {
                 return '"' . $proxyBase . urlencode($matches[1]) . '"';
             },
