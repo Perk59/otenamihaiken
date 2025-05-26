@@ -199,54 +199,38 @@ class AdvancedProxyHandler {
             CURLOPT_COOKIEJAR => $this->cookieJar,
             CURLOPT_COOKIEFILE => $this->cookieJar,
             CURLOPT_HEADERFUNCTION => [$this, 'handleResponseHeader'],
-            CURLOPT_ENCODING => 'gzip, deflate',
-            CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            CURLOPT_HTTPHEADER => $this->buildAdvancedHeaders(),
-            CURLOPT_WRITEFUNCTION => function($ch, $data) {
-                $dataLength = strlen($data);
-                if ($dataLength > 0) {
-                    echo $data;
-                }
-                return $dataLength;
-            }
+            // エンコーディングの明示的な指定
+            CURLOPT_ENCODING => 'gzip, deflate, br',
+            CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         ];
 
-        // HTTP/2サポート
         if (defined('CURL_HTTP_VERSION_2_0')) {
             $curlOptions[CURLOPT_HTTP_VERSION] = CURL_HTTP_VERSION_2_0;
         }
+
+        $headers = $this->buildAdvancedHeaders();
+        curl_setopt_array($ch, $curlOptions);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
 
         // リクエストメソッドとデータの設定
         if ($this->requestMethod !== 'GET') {
             $this->setRequestData($curlOptions);
         }
 
-        curl_setopt_array($ch, $curlOptions);
+        $content = curl_exec($ch);
 
-        // 出力バッファリングの開始
-        ob_start();
-        
-        $success = curl_exec($ch);
-        
-        if ($success === false) {
-            ob_end_clean();
+        if ($content === false) {
             $error = curl_error($ch);
             $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
             curl_close($ch);
-            
-            throw new Exception(sprintf(
-                'cURL error (%d): %s',
-                $httpCode,
-                $error
-            ));
+            throw new Exception(sprintf('cURL error (%d): %s', $httpCode, $error));
         }
 
-        $content = ob_get_clean();
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
         
         http_response_code($httpCode);
-        
+
         return $content;
     }
 
@@ -259,17 +243,17 @@ class AdvancedProxyHandler {
 
     private function buildAdvancedHeaders() {
         $headers = [
+            // 日本語を優先した Accept-Language の設定
+            'Accept-Language: ja,ja_JP;q=0.9,en-US;q=0.8,en;q=0.7',
             'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language: ja,en-US;q=0.9,en;q=0.8',
             'Accept-Encoding: gzip, deflate, br',
             'Connection: keep-alive',
             'Upgrade-Insecure-Requests: 1',
             'Sec-Fetch-Site: same-origin',
             'Sec-Fetch-Mode: cors',
             'Sec-Fetch-Dest: empty',
-            'Sec-Ch-Ua: "Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
-            'Sec-Ch-Ua-Mobile: ?0',
-            'Sec-Ch-Ua-Platform: "Windows"'
+            // 文字エンコーディングを明示的に指定
+            'Accept-Charset: utf-8,shift_jis,euc-jp,iso-2022-jp'
         ];
 
         // Instagram特有のヘッダー
@@ -278,26 +262,6 @@ class AdvancedProxyHandler {
             $headers[] = 'X-IG-App-ID: 936619743392459';
             $headers[] = 'X-Requested-With: XMLHttpRequest';
             $headers[] = 'Origin: https://www.instagram.com';
-            $headers[] = 'DNT: 1';
-        }
-
-        // 重要なヘッダーの転送
-        $forwardHeaders = [
-            'HTTP_AUTHORIZATION' => 'Authorization',
-            'HTTP_X_CSRF_TOKEN' => 'X-CSRFToken',
-            'HTTP_X_REQUESTED_WITH' => 'X-Requested-With',
-            'CONTENT_TYPE' => 'Content-Type'
-        ];
-
-        foreach ($forwardHeaders as $serverKey => $headerName) {
-            if (isset($_SERVER[$serverKey]) && !empty($_SERVER[$serverKey])) {
-                $headers[] = $headerName . ': ' . $_SERVER[$serverKey];
-            }
-        }
-
-        // Cookieの転送
-        if (isset($_SERVER['HTTP_COOKIE'])) {
-            $headers[] = 'Cookie: ' . $_SERVER['HTTP_COOKIE'];
         }
 
         return $headers;
@@ -342,115 +306,130 @@ class AdvancedProxyHandler {
     }
 
     private function sendResponse($content) {
+        // コンテンツタイプと文字セットの検出
+        $contentInfo = $this->detectContentType($content);
+        $contentType = $contentInfo['contentType'];
+        $charset = $contentInfo['charset'];
+
+        // 文字エンコーディングの変換が必要な場合
+        if ($charset !== 'utf-8' && function_exists('mb_convert_encoding')) {
+            $content = mb_convert_encoding($content, 'UTF-8', $charset);
+            $charset = 'utf-8';
+        }
+
+        // Content-Typeヘッダーの設定
         if (!headers_sent()) {
-            // 基本的なヘッダーの設定
-            header('Content-Type: ' . $this->detectContentType($content));
-            header('X-Proxy-Cache: BYPASS');
-            header('X-Content-Type-Options: nosniff');
-            
-            // レスポンスヘッダーの設定
-            if (!empty($this->responseHeaders)) {
-                $sentHeaders = [];
+            header("Content-Type: {$contentType}; charset=utf-8");
+        }
+
+        // その他のヘッダーの設定
+        if (!empty($this->responseHeaders)) {
+            foreach ($this->responseHeaders as $header) {
+                $headerLower = strtolower($header);
                 
-                foreach ($this->responseHeaders as $header) {
-                    // ヘッダー名と値を分離
-                    if (strpos($header, ':') !== false) {
-                        list($headerName, $headerValue) = explode(':', $header, 2);
-                        $headerName = trim($headerName);
-                        $headerValue = trim($headerValue);
-                        
-                        // 重複するヘッダーをスキップ
-                        $headerKey = strtolower($headerName);
-                        if (isset($sentHeaders[$headerKey])) {
-                            continue;
-                        }
-                        
-                        // 特定のヘッダーをスキップ
-                        if (in_array($headerKey, ['transfer-encoding', 'connection', 'content-length', 'content-encoding'])) {
-                            continue;
-                        }
-
-                        // セキュリティ関連のヘッダーの特別処理
-                        if ($headerKey === 'content-security-policy') {
-                            continue;
-                        }
-                        
-                        if ($headerKey === 'x-frame-options') {
-                            header('X-Frame-Options: SAMEORIGIN', true);
-                            continue;
-                        }
-
-                        try {
-                            header($headerName . ': ' . $headerValue, false);
-                            $sentHeaders[$headerKey] = true;
-                        } catch (Exception $e) {
-                            error_log('Error setting header: ' . $headerName);
-                        }
-                    }
+                // 特定のヘッダーをスキップ
+                if (strpos($headerLower, 'content-type:') === 0 ||
+                    strpos($headerLower, 'transfer-encoding:') === 0 ||
+                    strpos($headerLower, 'content-length:') === 0 ||
+                    strpos($headerLower, 'content-encoding:') === 0) {
+                    continue;
                 }
+
+                header($header);
             }
         }
 
-        // コンテンツの処理と出力
-        try {
-            $contentType = $this->detectContentType($content);
-            
-            if (strpos($contentType, 'text/html') !== false) {
+        // コンテンツの処理
+        switch ($contentType) {
+            case 'text/html':
                 $content = $this->processHtmlContent($content);
-            } elseif (strpos($contentType, 'text/css') !== false) {
+                break;
+            case 'text/css':
                 $content = $this->processCssContent($content);
-            } elseif (strpos($contentType, 'application/javascript') !== false || 
-                      strpos($contentType, 'text/javascript') !== false) {
+                break;
+            case 'application/javascript':
+            case 'text/javascript':
                 $content = $this->processJsContent($content);
-            }
-
-            // 出力バッファリングの設定
-            if (ob_get_level() == 0) {
-                ob_start();
-            }
-            
-            echo $content;
-            ob_end_flush();
-            
-        } catch (Exception $e) {
-            error_log('Content processing error: ' . $e->getMessage());
-            if (!headers_sent()) {
-                header('Content-Type: application/json');
-                echo json_encode([
-                    'error' => true,
-                    'message' => 'Content processing failed',
-                    'details' => $e->getMessage()
-                ]);
-            }
+                break;
+            case 'application/json':
+                $content = $this->ensureJsonEncoding($content);
+                break;
         }
-        
+
+        echo $content;
         return true;
     }
 
+    private function ensureJsonEncoding($content) {
+        // JSONデータのエンコーディング処理
+        if (function_exists('mb_convert_encoding')) {
+            $content = mb_convert_encoding($content, 'UTF-8', 'ASCII,JIS,UTF-8,EUC-JP,SJIS');
+        }
+        
+        // JSONの妥当性チェック
+        $decoded = json_decode($content);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            // エラーの場合、UTF-8でエンコードし直す
+            $content = utf8_encode($content);
+        }
+        
+        return $content;
+    }
+
     private function detectContentType($content) {
+        $contentType = 'text/plain';
+        $charset = 'utf-8';
+
         // レスポンスヘッダーからContent-Typeを検索
         if (!empty($this->responseHeaders)) {
             foreach ($this->responseHeaders as $header) {
                 if (stripos($header, 'Content-Type:') === 0) {
-                    return strtolower(trim(substr($header, 13)));
+                    $parts = explode(';', $header);
+                    $contentType = strtolower(trim(substr($parts[0], 13)));
+                    
+                    // 文字セットの検出
+                    foreach ($parts as $part) {
+                        if (stripos($part, 'charset=') !== false) {
+                            $charset = trim(substr($part, strpos($part, '=') + 1));
+                            break;
+                        }
+                    }
+                    break;
                 }
             }
         }
 
-        // コンテンツの内容からタイプを推測
-        if (strpos($content, '<!DOCTYPE html') !== false || strpos($content, '<html') !== false) {
-            return 'text/html';
+        // HTMLの場合はmetaタグから文字セットを検出
+        if (strpos($contentType, 'text/html') !== false) {
+            if (preg_match('/<meta[^>]+charset=[\'"]*([a-zA-Z0-9_-]+)/i', $content, $matches)) {
+                $charset = $matches[1];
+            }
         }
 
-        return 'text/plain';
+        return compact('contentType', 'charset');
     }
 
     private function processHtmlContent($content) {
+        // 文字エンコーディングメタタグの追加/更新
+        if (!preg_match('/<meta[^>]+charset/i', $content)) {
+            $content = preg_replace(
+                '/(<head[^>]*>)/i',
+                '$1<meta charset="utf-8">',
+                $content
+            );
+        } else {
+            $content = preg_replace(
+                '/(<meta[^>]+charset=[\'"]?)([a-zA-Z0-9_-]+)([\'"]?[^>]*>)/i',
+                '$1utf-8$3',
+                $content
+            );
+        }
+
+        // その他のHTML処理
         $baseUrl = parse_url($this->targetUrl);
         $baseHost = $baseUrl['scheme'] . '://' . $baseUrl['host'];
         $basePath = isset($baseUrl['path']) ? dirname($baseUrl['path']) : '';
 
-        // base要素の追加
         if (strpos($content, '<base') === false) {
             $content = preg_replace(
                 '/(<head[^>]*>)/i',
@@ -458,13 +437,6 @@ class AdvancedProxyHandler {
                 $content
             );
         }
-
-        // メタリフレッシュの除去
-        $content = preg_replace(
-            '/<meta[^>]+http-equiv=["\']?refresh["\']?[^>]*>/i',
-            '',
-            $content
-        );
 
         // URLの書き換え
         $content = $this->rewriteHtmlUrls($content);
