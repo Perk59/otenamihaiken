@@ -185,54 +185,109 @@ class AdvancedProxyHandler {
     }
 
     private function fetchContentWithCurl() {
-        $ch = curl_init();
-        
-        $curlOptions = [
-            CURLOPT_URL => $this->targetUrl,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS => 10,
-            CURLOPT_TIMEOUT => 30,
-            CURLOPT_CONNECTTIMEOUT => 10,
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_SSL_VERIFYHOST => false,
-            CURLOPT_COOKIEJAR => $this->cookieJar,
-            CURLOPT_COOKIEFILE => $this->cookieJar,
-            CURLOPT_HEADERFUNCTION => [$this, 'handleResponseHeader'],
-            // エンコーディングの明示的な指定
-            CURLOPT_ENCODING => 'gzip, deflate, br',
-            CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        ];
+    $ch = curl_init();
+    
+    $curlOptions = [
+        CURLOPT_URL => $this->targetUrl,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 10,
+        CURLOPT_TIMEOUT => 30,
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => false,
+        CURLOPT_COOKIEJAR => $this->cookieJar,
+        CURLOPT_COOKIEFILE => $this->cookieJar,
+        CURLOPT_HEADERFUNCTION => [$this, 'handleResponseHeader'],
+        // Instagram用の圧縮設定を調整
+        CURLOPT_ENCODING => '', // 空文字で自動的に対応可能な全ての圧縮を処理
+        CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        // バイナリセーフな転送を有効化
+        CURLOPT_BINARYTRANSFER => true
+    ];
 
-        if (defined('CURL_HTTP_VERSION_2_0')) {
-            $curlOptions[CURLOPT_HTTP_VERSION] = CURL_HTTP_VERSION_2_0;
-        }
+    if (defined('CURL_HTTP_VERSION_2_0')) {
+        $curlOptions[CURLOPT_HTTP_VERSION] = CURL_HTTP_VERSION_2_0;
+    }
 
-        $headers = $this->buildAdvancedHeaders();
-        curl_setopt_array($ch, $curlOptions);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    $headers = $this->buildAdvancedHeaders();
+    curl_setopt_array($ch, $curlOptions);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
 
-        // リクエストメソッドとデータの設定
-        if ($this->requestMethod !== 'GET') {
-            $this->setRequestData($curlOptions);
-        }
+    // リクエストメソッドとデータの設定
+    if ($this->requestMethod !== 'GET') {
+        $this->setRequestData($curlOptions);
+    }
 
-        $content = curl_exec($ch);
+    $content = curl_exec($ch);
 
-        if ($content === false) {
-            $error = curl_error($ch);
-            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            curl_close($ch);
-            throw new Exception(sprintf('cURL error (%d): %s', $httpCode, $error));
-        }
-
+    if ($content === false) {
+        $error = curl_error($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
-        
-        http_response_code($httpCode);
-
-        return $content;
+        throw new Exception(sprintf('cURL error (%d): %s', $httpCode, $error));
     }
+
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    
+    http_response_code($httpCode);
+
+    // Instagram特有の文字エンコーディング前処理
+    if (strpos($this->targetHost, 'instagram.com') !== false) {
+        $content = $this->preprocessInstagramContent($content);
+    }
+
+    return $content;
+}
+
+    private function preprocessInstagramContent($content) {
+    // バイナリデータかどうかをチェック
+    if (!mb_check_encoding($content, 'ASCII') && !mb_check_encoding($content, 'UTF-8')) {
+        // gzip圧縮されている可能性があるかチェック
+        if (substr($content, 0, 2) === "\x1f\x8b") {
+            $content = gzdecode($content);
+            if ($content === false) {
+                throw new Exception('Failed to decode gzip content');
+            }
+        }
+        // deflate圧縮のチェック
+        elseif (substr($content, 0, 2) === "\x78\x9c" || substr($content, 0, 2) === "\x78\x01" || substr($content, 0, 2) === "\x78\xda") {
+            $decompressed = gzinflate($content);
+            if ($decompressed !== false) {
+                $content = $decompressed;
+            }
+        }
+    }
+    
+    // 文字エンコーディングの検出と修正
+    $detectedEncoding = mb_detect_encoding($content, [
+        'UTF-8', 'UTF-16', 'UTF-16LE', 'UTF-16BE', 
+        'ASCII', 'ISO-8859-1', 'Windows-1252', 'CP1252'
+    ], true);
+    
+    if ($detectedEncoding && $detectedEncoding !== 'UTF-8') {
+        $converted = mb_convert_encoding($content, 'UTF-8', $detectedEncoding);
+        if ($converted !== false) {
+            $content = $converted;
+        }
+    }
+    
+    // 不正なUTF-8シーケンスの修正
+    if (!mb_check_encoding($content, 'UTF-8')) {
+        // mb_convert_encodingで強制的にUTF-8に変換
+        $content = mb_convert_encoding($content, 'UTF-8', 'UTF-8');
+        // それでもダメな場合はiconvを試す
+        if (!mb_check_encoding($content, 'UTF-8') && function_exists('iconv')) {
+            $iconvResult = iconv('UTF-8//IGNORE', 'UTF-8//IGNORE', $content);
+            if ($iconvResult !== false) {
+                $content = $iconvResult;
+            }
+        }
+    }
+    
+    return $content;
+}
 
     private function setRequestData(&$curlOptions) {
         $inputData = file_get_contents('php://input');
@@ -242,30 +297,32 @@ class AdvancedProxyHandler {
     }
 
     private function buildAdvancedHeaders() {
-        $headers = [
-            // 日本語を優先した Accept-Language の設定
-            'Accept-Language: ja,ja_JP;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Encoding: gzip, deflate, br',
-            'Connection: keep-alive',
-            'Upgrade-Insecure-Requests: 1',
-            'Sec-Fetch-Site: same-origin',
-            'Sec-Fetch-Mode: cors',
-            'Sec-Fetch-Dest: empty',
-            // 文字エンコーディングを明示的に指定
-            'Accept-Charset: utf-8,shift_jis,euc-jp,iso-2022-jp'
-        ];
+    $headers = [
+        'Accept-Language: ja,en-US;q=0.9,en;q=0.8',
+        'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Encoding: gzip, deflate, br',
+        'Connection: keep-alive',
+        'Upgrade-Insecure-Requests: 1',
+        'Sec-Fetch-Site: none',
+        'Sec-Fetch-Mode: navigate',
+        'Sec-Fetch-User: ?1',
+        'Sec-Fetch-Dest: document',
+        'Cache-Control: max-age=0'
+    ];
 
-        // Instagram特有のヘッダー
-        if (strpos($this->targetHost, 'instagram.com') !== false) {
-            $headers[] = 'X-Instagram-AJAX: 1';
-            $headers[] = 'X-IG-App-ID: 936619743392459';
-            $headers[] = 'X-Requested-With: XMLHttpRequest';
-            $headers[] = 'Origin: https://www.instagram.com';
-        }
-
-        return $headers;
+    // Instagram特有のヘッダー
+    if (strpos($this->targetHost, 'instagram.com') !== false) {
+        $headers = array_merge($headers, [
+            'Origin: https://www.instagram.com',
+            'Referer: https://www.instagram.com/',
+            'Sec-Ch-Ua: "Not_A Brand";v="8", "Chromium";v="120"',
+            'Sec-Ch-Ua-Mobile: ?0',
+            'Sec-Ch-Ua-Platform: "Windows"'
+        ]);
     }
+
+    return $headers;
+}
 
     private function handleResponseHeader($ch, $header) {
         $trimmedHeader = trim($header);
@@ -306,59 +363,78 @@ class AdvancedProxyHandler {
     }
 
     private function sendResponse($content) {
-        // コンテンツタイプと文字セットの検出
-        $contentInfo = $this->detectContentType($content);
-        $contentType = $contentInfo['contentType'];
-        $charset = $contentInfo['charset'];
-
-        // 文字エンコーディングの変換が必要な場合
-        if ($charset !== 'utf-8' && function_exists('mb_convert_encoding')) {
-            $content = mb_convert_encoding($content, 'UTF-8', $charset);
-            $charset = 'utf-8';
+    // Instagram特有の処理
+    if (strpos($this->targetHost, 'instagram.com') !== false) {
+        // 最終的な文字エンコーディングチェック
+        if (!mb_check_encoding($content, 'UTF-8')) {
+            // 最後の手段：htmlentitiesを使用
+            $content = htmlentities($content, ENT_QUOTES | ENT_HTML5, 'UTF-8', false);
+            $content = html_entity_decode($content, ENT_QUOTES | ENT_HTML5, 'UTF-8');
         }
-
-        // Content-Typeヘッダーの設定
-        if (!headers_sent()) {
-            header("Content-Type: {$contentType}; charset=utf-8");
-        }
-
-        // その他のヘッダーの設定
-        if (!empty($this->responseHeaders)) {
-            foreach ($this->responseHeaders as $header) {
-                $headerLower = strtolower($header);
-                
-                // 特定のヘッダーをスキップ
-                if (strpos($headerLower, 'content-type:') === 0 ||
-                    strpos($headerLower, 'transfer-encoding:') === 0 ||
-                    strpos($headerLower, 'content-length:') === 0 ||
-                    strpos($headerLower, 'content-encoding:') === 0) {
-                    continue;
-                }
-
-                header($header);
-            }
-        }
-
-        // コンテンツの処理
-        switch ($contentType) {
-            case 'text/html':
-                $content = $this->processHtmlContent($content);
-                break;
-            case 'text/css':
-                $content = $this->processCssContent($content);
-                break;
-            case 'application/javascript':
-            case 'text/javascript':
-                $content = $this->processJsContent($content);
-                break;
-            case 'application/json':
-                $content = $this->ensureJsonEncoding($content);
-                break;
-        }
-
-        echo $content;
-        return true;
     }
+
+    // コンテンツタイプの検出
+    $contentInfo = $this->detectContentType($content);
+    $contentType = $contentInfo['contentType'];
+
+    // ヘッダーの設定（必ずUTF-8で送信）
+    if (!headers_sent()) {
+        header("Content-Type: {$contentType}; charset=utf-8");
+        header("X-Content-Type-Options: nosniff");
+        
+        // Instagram用の追加ヘッダー
+        if (strpos($this->targetHost, 'instagram.com') !== false) {
+            header("Cache-Control: no-cache, no-store, must-revalidate");
+            header("Pragma: no-cache");
+            header("Expires: 0");
+        }
+    }
+
+    // CSPとその他の制限ヘッダーを除去
+    if (!empty($this->responseHeaders)) {
+        foreach ($this->responseHeaders as $header) {
+            $headerLower = strtolower($header);
+            
+            // スキップするヘッダー
+            if (strpos($headerLower, 'content-type:') === 0 ||
+                strpos($headerLower, 'transfer-encoding:') === 0 ||
+                strpos($headerLower, 'content-length:') === 0 ||
+                strpos($headerLower, 'content-encoding:') === 0 ||
+                strpos($headerLower, 'content-security-policy') === 0 ||
+                strpos($headerLower, 'x-frame-options:') === 0 ||
+                strpos($headerLower, 'x-content-type-options:') === 0) {
+                continue;
+            }
+
+            header($header);
+        }
+    }
+
+    // コンテンツの処理
+    switch ($contentType) {
+        case 'text/html':
+            $content = $this->processHtmlContent($content);
+            break;
+        case 'text/css':
+            $content = $this->processCssContent($content);
+            break;
+        case 'application/javascript':
+        case 'text/javascript':
+            $content = $this->processJsContent($content);
+            break;
+        case 'application/json':
+            $content = $this->ensureJsonEncoding($content);
+            break;
+    }
+
+    // 最終出力前のUTF-8チェック
+    if (!mb_check_encoding($content, 'UTF-8')) {
+        $content = mb_convert_encoding($content, 'UTF-8', 'auto');
+    }
+
+    echo $content;
+    return true;
+}
 
     private function ensureJsonEncoding($content) {
         // JSONデータのエンコーディング処理
@@ -377,76 +453,33 @@ class AdvancedProxyHandler {
     }
 
     private function detectContentType($content) {
-        $contentType = 'text/plain';
-        $charset = 'utf-8';
+    $contentType = 'text/html'; // デフォルトをHTMLに変更
+    $charset = 'utf-8';
 
-        // レスポンスヘッダーからContent-Typeを検索
-        if (!empty($this->responseHeaders)) {
-            foreach ($this->responseHeaders as $header) {
-                if (stripos($header, 'Content-Type:') === 0) {
-                    $parts = explode(';', $header);
-                    $contentType = strtolower(trim(substr($parts[0], 13)));
-                    
-                    // 文字セットの検出
-                    foreach ($parts as $part) {
-                        if (stripos($part, 'charset=') !== false) {
-                            $charset = trim(substr($part, strpos($part, '=') + 1));
-                            break;
-                        }
-                    }
-                    break;
-                }
+    // レスポンスヘッダーからContent-Typeを検索
+    if (!empty($this->responseHeaders)) {
+        foreach ($this->responseHeaders as $header) {
+            if (stripos($header, 'Content-Type:') === 0) {
+                $headerValue = trim(substr($header, 13));
+                $parts = explode(';', $headerValue);
+                $contentType = strtolower(trim($parts[0]));
+                break;
             }
         }
-
-        // HTMLの場合はmetaタグから文字セットを検出
-        if (strpos($contentType, 'text/html') !== false) {
-            if (preg_match('/<meta[^>]+charset=[\'"]*([a-zA-Z0-9_-]+)/i', $content, $matches)) {
-                $charset = $matches[1];
-            }
-        }
-
-        return compact('contentType', 'charset');
     }
 
-    private function processHtmlContent($content) {
-        // 文字エンコーディングメタタグの追加/更新
-        if (!preg_match('/<meta[^>]+charset/i', $content)) {
-            $content = preg_replace(
-                '/(<head[^>]*>)/i',
-                '$1<meta charset="utf-8">',
-                $content
-            );
-        } else {
-            $content = preg_replace(
-                '/(<meta[^>]+charset=[\'"]?)([a-zA-Z0-9_-]+)([\'"]?[^>]*>)/i',
-                '$1utf-8$3',
-                $content
-            );
+    // Instagram の場合、HTMLとして扱う
+    if (strpos($this->targetHost, 'instagram.com') !== false) {
+        if (strpos($content, '<!DOCTYPE html') !== false || 
+            strpos($content, '<html') !== false || 
+            strpos($content, '<head') !== false) {
+            $contentType = 'text/html';
         }
-
-        // その他のHTML処理
-        $baseUrl = parse_url($this->targetUrl);
-        $baseHost = $baseUrl['scheme'] . '://' . $baseUrl['host'];
-        $basePath = isset($baseUrl['path']) ? dirname($baseUrl['path']) : '';
-
-        if (strpos($content, '<base') === false) {
-            $content = preg_replace(
-                '/(<head[^>]*>)/i',
-                '$1<base href="' . $baseHost . $basePath . '/">',
-                $content
-            );
-        }
-
-        // URLの書き換え
-        $content = $this->rewriteHtmlUrls($content);
-
-        // プロキシスクリプトの追加
-        $proxyScript = $this->generateProxyScript();
-        $content = str_replace('</body>', $proxyScript . '</body>', $content);
-
-        return $content;
     }
+
+    return compact('contentType', 'charset');
+}
+
 
     private function rewriteHtmlUrls($content) {
         $baseHost = $this->targetScheme . '://' . $this->targetHost;
